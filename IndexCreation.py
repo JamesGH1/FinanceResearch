@@ -1,185 +1,135 @@
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates # For better date formatting
-import openpyxl 
+import matplotlib.dates as mdates
 
-def create_and_plot_financial_index(excel_filepath, sheet_name=0, base_value=100):
+def load_and_prepare_data(filepath, sheet_name=0):
     """
-    Creates an equally weighted financial index from company stock prices
-    read from an Excel file and plots it. Handles different IPO dates.
-
-    The Excel file should have 'Exchange Date' as the first column,
-    and subsequent columns for each company's closing price.
-
-    Args:
-        excel_filepath (str): Path to the Excel file.
-        sheet_name (str or int, optional): Sheet name or index if the Excel file
-                                           has multiple sheets. Defaults to 0 (the first sheet).
-        base_value (float, optional): The value to which each stock (and thus the initial index)
-                                      is conceptually rebased. Defaults to 100.
-
-    Returns:
-        pandas.Series: The calculated financial index.
-                       Returns None if an error occurs or no data is processed.
+    Loads data from a single Excel file, and prepares it.
+    Each pair of (Exchange Date, Price) columns is treated as a separate company.
     """
-    try:
-        # 1. Load Data
-        # Assuming the first column is the date and should be the index
-        df_prices = pd.read_excel(excel_filepath, sheet_name=sheet_name, index_col=0)
-        
-        # Ensure the index is parsed as datetime objects
-        df_prices.index = pd.to_datetime(df_prices.index)
-        
-        # Sort by date, just in case it's not already
-        df_prices = df_prices.sort_index()
+    xls = pd.ExcelFile(filepath)
+    df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=0)
 
-        print("--- Original Data (first 5 rows) ---")
-        print(df_prices.head())
+    all_company_data = []
+    company_names = []
 
-        if df_prices.empty:
-            print("Error: The DataFrame is empty after loading. Check the Excel file and sheet name.")
-            return None
+    for i in range(0, df_raw.shape[1], 2):
+        date_col_name = df_raw.columns[i]
+        price_col_name = df_raw.columns[i+1]
+        company_name = price_col_name
 
-        # 2. Rebase Each Stock
-        # We will create a new DataFrame for rebased prices
-        df_rebased = pd.DataFrame(index=df_prices.index)
+        company_df = df_raw[[date_col_name, price_col_name]].copy()
+        company_df.columns = ['Date', 'Price']
+        company_df['Date'] = pd.to_datetime(company_df['Date'])
+        company_df.dropna(subset=['Price'], inplace=True)
+        company_df.set_index('Date', inplace=True)
+        company_df.rename(columns={'Price': company_name}, inplace=True)
 
-        valid_companies_for_index = []
+        if not company_df.empty:
+            all_company_data.append(company_df)
+            company_names.append(company_name)
 
-        for company_name in df_prices.columns:
-            stock_prices = df_prices[company_name].copy()
-            
-            # Find the first valid price for this stock (its "IPO price" in this dataset)
-            first_valid_index = stock_prices.first_valid_index()
-            
-            if first_valid_index is None:
-                print(f"Warning: Company '{company_name}' has no price data. Skipping.")
-                continue
-                
-            first_price = stock_prices[first_valid_index]
-            
-            if pd.isna(first_price) or first_price == 0:
-                print(f"Warning: First price for company '{company_name}' is NaN or zero. Skipping.")
-                continue
+    if not all_company_data:
+        return pd.DataFrame(), []
 
-            # Rebase: (Price_t / Price_first_day) * BaseValue
-            # This makes the stock's "value" start at `base_value` on its first day of data
-            # It will be NaN before its first_valid_index
-            rebased_series = (stock_prices / first_price) * base_value
-            df_rebased[company_name] = rebased_series
-            valid_companies_for_index.append(company_name)
+    merged_df = pd.concat(all_company_data, axis=1, join='outer')
+    merged_df.sort_index(inplace=True)
+    return merged_df, company_names
 
-        if not valid_companies_for_index:
-            print("Error: No valid company data found to create an index.")
-            return None
-            
-        print(f"\n--- Rebased Data for {len(valid_companies_for_index)} companies (first 5 rows) ---")
-        print(df_rebased[valid_companies_for_index].head())
+def calculate_equal_weighted_index(price_data_df, base_value=100):
+    """
+    Calculates an equal-weighted index.
+    """
+    filled_price_data = price_data_df.ffill()
+    daily_returns = filled_price_data.pct_change()
+    num_companies_active = filled_price_data.notna().sum(axis=1)
+    index_daily_returns = daily_returns.mean(axis=1)
 
-        # 3. Calculate the Index
-        # The index is the mean of the rebased prices of available stocks at each point in time.
-        # .mean(axis=1) calculates the mean across columns for each row, automatically skipping NaNs.
-        financial_index = df_rebased[valid_companies_for_index].mean(axis=1)
-        
-        # Remove any leading NaNs from the index itself (e.g., if all first prices are on different days)
-        financial_index = financial_index.loc[financial_index.first_valid_index():]
+    first_valid_date = None
+    if not num_companies_active[num_companies_active > 0].empty:
+        first_valid_date = num_companies_active[num_companies_active > 0].index[0]
+        index_daily_returns.loc[first_valid_date] = 0
+    else: # Handle case where there's no valid data at all
+        return pd.Series(dtype=float), daily_returns, filled_price_data, num_companies_active
 
 
-        if financial_index.empty:
-            print("Error: The resulting index is empty. This could happen if there are no overlapping periods of data.")
-            return None
+    index_values = base_value * (1 + index_daily_returns).cumprod()
+    index_values = index_values.reindex(filled_price_data.index)
 
-        print("\n--- Calculated Financial Index (first 5 values) ---")
-        print(financial_index.head())
-        print("\n--- Calculated Financial Index (last 5 values) ---")
-        print(financial_index.tail())
+    if first_valid_date:
+        # Set NaNs for dates before any stock was active
+        if index_values.index[0] < first_valid_date:
+             index_values.loc[:pd.Timestamp(first_valid_date) - pd.Timedelta(days=1)] = float('nan')
+        # Ensure the first valid date starts exactly at base_value
+        index_values.loc[first_valid_date] = base_value
+    else: # If no valid date, the whole series should be NaN
+        index_values[:] = float('nan')
 
-        # 4. Plot the Index
-        plt.figure(figsize=(14, 7))
-        plt.plot(financial_index.index, financial_index.values, label=f'Custom Financial Index (Base {base_value})', color='dodgerblue')
-        
-        plt.title('Custom Equally Weighted Financial Index Over Time', fontsize=16)
-        plt.xlabel('Date', fontsize=12)
-        plt.ylabel(f'Index Value (Rebased to {base_value})', fontsize=12)
-        plt.legend(fontsize=10)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        
-        # Improve date formatting on x-axis
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=10))
-        plt.xticks(rotation=30, ha='right')
-        
-        plt.tight_layout() # Adjust plot to prevent labels from overlapping
-        plt.show()
 
-        return financial_index
+    return index_values, daily_returns, filled_price_data, num_companies_active
 
-    except FileNotFoundError:
-        print(f"Error: The file '{excel_filepath}' was not found.")
-        return None
-    except KeyError as e:
-        print(f"Error: A required column might be missing or named incorrectly (e.g., 'Exchange Date' as index). Details: {e}")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return None
+def plot_monthly_index(index_series, title='Monthly Index Performance'):
+    """
+    Plots the index performance on a monthly basis.
+    Uses the last available index value of each month.
+    """
+    if index_series.empty or index_series.dropna().empty:
+        print("Index series is empty or contains all NaNs. Cannot plot.")
+        return
 
-# --- Example Usage ---
-if __name__ == "__main__":
-    # To use this script:
-    # 1. Save your Excel file (e.g., "stock_data.xlsx") in the same directory as this script,
-    #    or provide the full path.
-    # 2. Make sure the first column is named 'Exchange Date' (or similar, and adjust index_col if needed)
-    #    and contains dates. Subsequent columns should be company stock prices.
-    # 3. Run the script.
+    # Resample to get the last trading day's value of each month
+    monthly_index = index_series.resample('M').last() # 'M' stands for month-end frequency
 
-    # Create a dummy Excel file based on the provided image format for demonstration
-    data = {
-        'Exchange Date': pd.to_datetime([
-            '2025-05-07', '2025-05-06', '2025-05-05', '2025-05-02', '2025-05-01',
-            '2025-04-30', '2025-04-29', '2025-04-28', '2025-04-25', '2025-04-24',
-            '2025-04-23', '2025-04-22', '2025-04-21', '2025-04-17', '2025-04-16',
-            '2025-04-15'
-        ]),
-        'DAVE': [
-            107.83, 105.92, 104.75, 104.72, 96.43, 94.82, 95.22, 93.68, 92.93, 89.96,
-            85.91, 83.37, 80.66, 84.27, 82.17, 83.84
-        ],
-        'ZIP': [
-            1.1722, 1.0485, 1.0444, 1.0565, 1.1011, 1.1075, 1.1039, 1.0738, 1.0735, 1.0015,
-            0.9611, 1.0607, 1.0955, 0.9386, 0.9487, 0.9333
-        ],
-        'WISE': [
-            13.57, 13.77, None, 13.66, 13.21, 13.04, 13.25, 13.00, 12.89, 12.93,
-            12.82, 12.77, 12.77, 12.82, 12.85, 12.60
-        ], # WISE has a None on 05-May
-        'RELY': [
-            21.09, 21.20, 20.99, 20.94, 20.27, 20.22, 20.41, 20.01, 20.05, 19.98,
-            19.63, 19.35, 19.10, 19.93, 19.84, 20.19
-        ],
-        'NEWCO': [ # A company that IPOs later
-            None, None, None, None, None, None, None, 50.00, 51.50, 50.75,
-            49.00, 49.50, 48.00, None, None, None # Assume some missing data too
-        ]
-    }
-    dummy_df = pd.DataFrame(data)
-    dummy_df = dummy_df.set_index('Exchange Date').sort_index() # Sort ascending for typical time series
-    
-    # If your actual data is sorted descending (newest first), you'll need to sort it:
-    # dummy_df = dummy_df.sort_index(ascending=True) 
-    # The script already does df_prices.sort_index()
+    # Drop NaN values that might result from months with no data
+    monthly_index = monthly_index.dropna()
 
-    dummy_excel_file = 'All Financial Institutions.xlsx'
-    dummy_df.to_excel(dummy_excel_file, sheet_name='StockData')
-    print(f"Dummy Excel file '{dummy_excel_file}' created with sheet 'StockData'.")
+    if monthly_index.empty:
+        print("No data available for monthly plotting after resampling and dropping NaNs.")
+        return
 
-    # Call the function with the dummy file
-    # Replace 'sample_financial_data.xlsx' with your actual file name
-    # and 'StockData' with your actual sheet name if it's different.
-    index_series = create_and_plot_financial_index(dummy_excel_file, sheet_name='StockData')
+    plt.figure(figsize=(12, 6))
+    plt.plot(monthly_index.index, monthly_index.values, marker='o', linestyle='-')
 
-    if index_series is not None:
-        print("\n--- Index Series successfully created. ---")
-        # You can save the index to a new Excel or CSV file if needed:
-        # index_series.to_csv('financial_index.csv', header=['IndexValue'])
-        # index_series.to_excel('financial_index.xlsx', sheet_name='Index')
+    plt.title(title)
+    plt.xlabel('Date')
+    plt.ylabel('Index Value')
+    plt.grid(True)
+
+    # Format the x-axis to show dates nicely
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, len(monthly_index) // 12))) # Adjust interval for readability
+    plt.gcf().autofmt_xdate() # Auto-formats the x-axis labels to prevent overlap
+
+    plt.show()
+
+# --- Main Script ---
+
+# Define your file paths
+file_path1Neo = 'Neo Banks Price History/All Neo Banks PH.xlsx' # <--- IMPORTANT: CHANGE THIS TO YOUR ACTUAL FILE NAME
+file_path2Cha = 'Challenger Banks Price History/All Challenger Banks PH.xlsx'
+
+# Load and prepare data
+combined_prices_df, all_company_names = load_and_prepare_data(file_path1)
+
+if not combined_prices_df.empty:
+    print("--- Combined and Aligned Price Data (Head) ---")
+    print(combined_prices_df.head())
+
+    # Calculate the equal-weighted index
+    neo_bank_index, _, _, _ = calculate_equal_weighted_index(combined_prices_df, base_value=100)
+
+    print("\n--- Calculated Neo Bank Index (First 5 values) ---")
+    print(neo_bank_index.head())
+    print("\n--- Calculated Neo Bank Index (Last 5 values) ---")
+    print(neo_bank_index.tail())
+
+    # Plot the monthly index performance
+    plot_monthly_index(neo_bank_index, title='Neo Bank Index - Monthly Performance')
+
+    # To save the index to a new Excel file:
+    # neo_bank_index_df = pd.DataFrame(neo_bank_index, columns=['NeoBankIndex'])
+    # neo_bank_index_df.to_excel('neo_bank_index.xlsx')
+    # print("\nIndex saved to neo_bank_index.xlsx")
+
+else:
+    print(f"No data loaded from {file_path1}. Please check file path and Excel sheet structure.")
