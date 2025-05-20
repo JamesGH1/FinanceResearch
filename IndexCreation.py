@@ -1,6 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates # For better date formatting
+import openpyxl 
 
 def create_and_plot_financial_index(excel_filepath, sheet_name=0, base_value=100):
     """
